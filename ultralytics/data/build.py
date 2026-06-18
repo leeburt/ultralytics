@@ -399,7 +399,9 @@ def check_source(
     elif isinstance(source, LOADERS):
         in_memory = True
     elif isinstance(source, (list, tuple)):
-        if all(isinstance(s, (str, Path)) for s in source):
+        if all(isinstance(s, (str, Path)) for s in source) and not any(
+            str(s).startswith(("https://", "http://", "rtsp://", "rtmp://", "tcp://")) for s in source
+        ):
             source = [str(Path(s)) for s in source]  # normalize paths
         else:
             source = autocast_list(source)  # convert all list elements to PIL or np arrays
