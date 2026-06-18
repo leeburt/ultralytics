@@ -399,8 +399,11 @@ def check_source(
     elif isinstance(source, LOADERS):
         in_memory = True
     elif isinstance(source, (list, tuple)):
-        source = autocast_list(source)  # convert all list elements to PIL or np arrays
-        from_img = True
+        if all(isinstance(s, (str, Path)) for s in source):
+            source = [str(Path(s)) for s in source]  # normalize paths
+        else:
+            source = autocast_list(source)  # convert all list elements to PIL or np arrays
+            from_img = True
     elif isinstance(source, (Image.Image, np.ndarray)):
         from_img = True
     elif isinstance(source, torch.Tensor):
