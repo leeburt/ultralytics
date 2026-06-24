@@ -13,6 +13,7 @@ from ultralytics.models import yolo
 from ultralytics.nn.tasks import (
     ClassificationModel,
     DetectionModel,
+    KeypointModel,
     OBBModel,
     PoseModel,
     SegmentationModel,
@@ -110,6 +111,12 @@ class YOLO(Model):
                 "trainer": yolo.pose.PoseTrainer,
                 "validator": yolo.pose.PoseValidator,
                 "predictor": yolo.pose.PosePredictor,
+            },
+            "keypoint": {
+                "model": KeypointModel,
+                "trainer": yolo.keypoint.KeypointTrainer,
+                "validator": yolo.keypoint.KeypointValidator,
+                "predictor": yolo.keypoint.KeypointPredictor,
             },
             "obb": {
                 "model": OBBModel,

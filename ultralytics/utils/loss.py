@@ -331,6 +331,207 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
+class KeypointOnlyLoss:
+    """Loss for dense keypoint-only models without bounding boxes or classes."""
+
+    def __init__(self, model: torch.nn.Module):
+        """Initialize keypoint-only loss state from the model head."""
+        self.head = model.model[-1]
+        self.kpt_shape = self.head.kpt_shape
+        self.nkpt = self.kpt_shape[0]
+        self.bce = nn.BCEWithLogitsLoss(reduction="sum")
+
+    def __call__(
+        self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute keypoint confidence and location losses."""
+        if isinstance(preds, (tuple, list)):
+            preds = preds[1]
+        raw = preds["kpts"]
+        feats = preds["feats"]
+        bs = raw.shape[0]
+        dtype = raw.dtype
+        device = raw.device
+        self.head._make_anchors(feats)
+        anchors = self.head.anchors.to(device=device, dtype=dtype)
+        strides = self.head.strides.to(device=device, dtype=dtype).view(-1)
+        na = anchors.shape[0]
+        pred = raw.view(bs, self.nkpt, 3, na).permute(0, 3, 1, 2).contiguous()
+        target_obj = torch.zeros((bs, na, self.nkpt), device=device, dtype=dtype)
+        target_xy = torch.zeros((bs, na, self.nkpt, 2), device=device, dtype=dtype)
+
+        keypoints = batch.get("keypoints")
+        batch_idx = batch.get("batch_idx")
+        if keypoints is not None and batch_idx is not None and keypoints.numel():
+            keypoints = keypoints.to(device=device, dtype=dtype)
+            batch_idx = batch_idx.to(device=device, dtype=torch.long).view(-1)
+            imgsz = torch.tensor(feats[0].shape[2:], device=device, dtype=dtype) * self.head.stride[0]
+            keypoints_abs = keypoints.clone()
+            keypoints_abs[..., 0] *= imgsz[1]
+            keypoints_abs[..., 1] *= imgsz[0]
+            assigned = torch.zeros((bs, na, self.nkpt), device=device, dtype=torch.bool)
+            for i in range(keypoints_abs.shape[0]):
+                b = int(batch_idx[i].item())
+                if b < 0 or b >= bs:
+                    continue
+                for k in range(self.nkpt):
+                    visible = keypoints_abs[i, k, 2] > 0 if keypoints_abs.shape[-1] == 3 else True
+                    if not visible:
+                        continue
+                    xy_cell = keypoints_abs[i, k, :2] / strides[:, None]
+                    dist = ((anchors - xy_cell) ** 2).sum(1)
+                    if assigned[b, :, k].all():
+                        continue
+                    dist = dist.masked_fill(assigned[b, :, k], torch.inf)
+                    anchor_idx = int(dist.argmin().item())
+                    assigned[b, anchor_idx, k] = True
+                    target_obj[b, anchor_idx, k] = 1.0
+                    target_xy[b, anchor_idx, k] = keypoints_abs[i, k, :2]
+
+        obj_logits = pred[..., 2]
+        pos = target_obj.bool()
+        obj_loss = self.bce(obj_logits, target_obj) / max(float(bs), 1.0)
+        if pos.any():
+            decoded_xy = (pred[..., :2].sigmoid() * 2.0 - 0.5 + anchors.view(1, na, 1, 2)) * strides.view(1, na, 1, 1)
+            loc_loss = F.smooth_l1_loss(decoded_xy[pos], target_xy[pos], reduction="sum") / pos.sum().clamp(min=1)
+            obj_loss = obj_loss / pos.sum().clamp(min=1)
+        else:
+            loc_loss = raw.sum() * 0.0
+
+        loss_items = torch.stack((loc_loss, obj_loss))
+        return loss_items.sum() * bs, loss_items.detach()
+
+
+class KeypointHeatmapLoss:
+    """CenterNet-style keypoint heatmap loss with local offset regression."""
+
+    def __init__(self, model: torch.nn.Module):
+        """Initialize heatmap loss state from the model head."""
+        self.head = model.model[-1]
+        self.kpt_shape = self.head.kpt_shape
+        self.nkpt = self.kpt_shape[0]
+        self.hm_weight = 1.0
+        self.off_weight = 1.0
+        self.min_radius = int(getattr(self.head, "hm_min_radius", 0))
+        self.radius_add = int(getattr(self.head, "hm_radius_add", 0))
+        self.fallback_radius = 2
+
+    def __call__(
+        self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute heatmap focal loss and center-offset loss."""
+        if isinstance(preds, (tuple, list)):
+            preds = preds[1]
+        hm_logits = preds["hm"]
+        offsets = preds["offset"]
+        bs, _, h, w = hm_logits.shape
+        dtype = hm_logits.dtype
+        device = hm_logits.device
+        stride = self.head.stride.to(device=device, dtype=dtype).view(-1)[0]
+
+        target_hm = torch.zeros_like(hm_logits)
+        target_off = torch.zeros((bs, self.nkpt, 2, h, w), device=device, dtype=dtype)
+        off_mask = torch.zeros((bs, self.nkpt, h, w), device=device, dtype=torch.bool)
+
+        keypoints = batch.get("keypoints")
+        batch_idx = batch.get("batch_idx")
+        bboxes = batch.get("bboxes")
+        if keypoints is not None and batch_idx is not None and keypoints.numel():
+            keypoints = keypoints.to(device=device, dtype=dtype)
+            batch_idx = batch_idx.to(device=device, dtype=torch.long).view(-1)
+            bboxes = bboxes.to(device=device, dtype=dtype) if bboxes is not None and bboxes.numel() else None
+            imgsz = torch.tensor((h, w), device=device, dtype=dtype) * stride
+            keypoints_abs = keypoints.clone()
+            keypoints_abs[..., 0] *= imgsz[1]
+            keypoints_abs[..., 1] *= imgsz[0]
+            for i in range(keypoints_abs.shape[0]):
+                b = int(batch_idx[i].item())
+                if b < 0 or b >= bs:
+                    continue
+                for k in range(self.nkpt):
+                    visible = keypoints_abs[i, k, 2] > 0 if keypoints_abs.shape[-1] == 3 else True
+                    if not visible:
+                        continue
+                    xy = keypoints_abs[i, k, :2] / stride
+                    x = xy[0].clamp(0, max(float(w) - 1e-4, 0.0))
+                    y = xy[1].clamp(0, max(float(h) - 1e-4, 0.0))
+                    xi, yi = int(x.floor().item()), int(y.floor().item())
+                    radius = self.fallback_radius
+                    if bboxes is not None and i < bboxes.shape[0]:
+                        box_w = float((bboxes[i, 2] * imgsz[1] / stride).clamp(min=0).item())
+                        box_h = float((bboxes[i, 3] * imgsz[0] / stride).clamp(min=0).item())
+                        radius = max(self.min_radius, int(self._gaussian_radius((box_h, box_w))) + self.radius_add)
+                    self._draw_gaussian(target_hm[b, k], xi, yi, radius)
+                    # Normalize offsets to feature-cell units, matching CenterNet/B: target is fractional cell offset.
+                    target_off[b, k, 0, yi, xi] = x - xi
+                    target_off[b, k, 1, yi, xi] = y - yi
+                    off_mask[b, k, yi, xi] = True
+
+        hm_loss = self._focal_loss(hm_logits, target_hm)
+        off = offsets.view(bs, self.nkpt, 2, h, w)
+        if off_mask.any():
+            off_loss = F.l1_loss(off.permute(0, 1, 3, 4, 2)[off_mask], target_off.permute(0, 1, 3, 4, 2)[off_mask], reduction="sum")
+            off_loss = off_loss / (off_mask.sum().clamp(min=1).to(dtype) * 2.0)
+        else:
+            off_loss = offsets.sum() * 0.0
+
+        loss_items = torch.stack((hm_loss * self.hm_weight, off_loss * self.off_weight))
+        return loss_items.sum() * bs, loss_items.detach()
+
+    @staticmethod
+    def _focal_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        """Modified focal loss used by CenterNet."""
+        pred = pred.sigmoid().clamp(1e-4, 1 - 1e-4)
+        pos = gt.eq(1)
+        neg = gt.lt(1)
+        neg_weights = (1 - gt).pow(4)
+        pos_loss = -(pred.log() * (1 - pred).pow(2) * pos).sum()
+        neg_loss = -((1 - pred).log() * pred.pow(2) * neg_weights * neg).sum()
+        num_pos = pos.sum().clamp(min=1)
+        return (pos_loss + neg_loss) / num_pos
+
+    @staticmethod
+    def _draw_gaussian(heatmap: torch.Tensor, x: int, y: int, radius: int) -> None:
+        """Draw a small Gaussian peak on a heatmap in-place."""
+        diameter = 2 * radius + 1
+        xs = torch.arange(diameter, device=heatmap.device, dtype=heatmap.dtype) - radius
+        yy, xx = torch.meshgrid(xs, xs, indexing="ij")
+        gaussian = torch.exp(-(xx**2 + yy**2) / (2 * (diameter / 6) ** 2))
+
+        height, width = heatmap.shape
+        left, right = min(x, radius), min(width - x - 1, radius)
+        top, bottom = min(y, radius), min(height - y - 1, radius)
+        patch = heatmap[y - top : y + bottom + 1, x - left : x + right + 1]
+        gpatch = gaussian[radius - top : radius + bottom + 1, radius - left : radius + right + 1]
+        torch.maximum(patch, gpatch, out=patch)
+
+    @staticmethod
+    def _gaussian_radius(det_size: tuple[float, float], min_overlap: float = 0.7) -> float:
+        """Compute CenterNet Gaussian radius from object size on the output feature map."""
+        height, width = det_size
+        if height <= 0 or width <= 0:
+            return 0.0
+
+        a1 = 1.0
+        b1 = height + width
+        c1 = width * height * (1 - min_overlap) / (1 + min_overlap)
+        sq1 = math.sqrt(max(0.0, b1**2 - 4 * a1 * c1))
+        r1 = (b1 + sq1) / 2
+
+        a2 = 4.0
+        b2 = 2 * (height + width)
+        c2 = (1 - min_overlap) * width * height
+        sq2 = math.sqrt(max(0.0, b2**2 - 4 * a2 * c2))
+        r2 = (b2 + sq2) / 2
+
+        a3 = 4 * min_overlap
+        b3 = -2 * min_overlap * (height + width)
+        c3 = (min_overlap - 1) * width * height
+        sq3 = math.sqrt(max(0.0, b3**2 - 4 * a3 * c3))
+        r3 = (b3 + sq3) / 2
+        return min(r1, r2, r3)
+
+
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 

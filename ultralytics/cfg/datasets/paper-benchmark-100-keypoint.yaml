@@ -1,0 +1,6 @@
+train: /data-ssd/libo/p100/yolo_utils/dataset/external_inline/paper_benchmark_100/images/val
+val: /data-ssd/libo/p100/yolo_utils/dataset/external_inline/paper_benchmark_100/images/val
+nc: 1
+kpt_shape: [1, 3]
+names:
+  0: in_line

@@ -24,6 +24,8 @@ __all__ = (
     "OBB",
     "Classify",
     "Detect",
+    "KeypointDetect",
+    "KeypointHeatmap",
     "Pose",
     "RTDETRDecoder",
     "Segment",
@@ -260,6 +262,148 @@ class Detect(nn.Module):
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+class KeypointDetect(nn.Module):
+    """Dense keypoint-only head that predicts point coordinates and confidences without boxes or classes."""
+
+    dynamic = False
+    export = False
+    format = None
+    shape = None
+    anchors = torch.empty(0)
+    strides = torch.empty(0)
+    max_det = 300
+
+    def __init__(self, kpt_shape: tuple = (1, 3), ch: tuple = ()):
+        """Initialize keypoint-only prediction layers.
+
+        Args:
+            kpt_shape (tuple): Number of keypoints and dimensions. Dimensions may be 2 or 3.
+            ch (tuple): Feature map channels from the neck.
+        """
+        super().__init__()
+        self.kpt_shape = kpt_shape
+        self.nkpt = kpt_shape[0]
+        self.ndim = kpt_shape[1]
+        self.no = self.nkpt * 3  # x-offset, y-offset, confidence for each keypoint
+        self.nl = len(ch)
+        self.stride = torch.zeros(self.nl)
+        c = max(ch[0] // 4, self.no)
+        self.cv = nn.ModuleList(nn.Sequential(Conv(x, c, 3), Conv(c, c, 3), nn.Conv2d(c, self.no, 1)) for x in ch)
+
+    def forward(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict]:
+        """Return raw keypoint predictions during training, decoded point candidates during inference."""
+        bs = x[0].shape[0]
+        raw = torch.cat([self.cv[i](x[i]).view(bs, self.no, -1) for i in range(self.nl)], 2)
+        preds = {"kpts": raw, "feats": x}
+        if self.training:
+            return preds
+        decoded = self.decode(preds)
+        return decoded if self.export else (decoded, preds)
+
+    def _make_anchors(self, feats: list[torch.Tensor]) -> None:
+        """Create anchor points for all feature maps."""
+        shape = feats[0].shape
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = make_anchors(feats, self.stride, 0.5)
+            self.shape = shape
+
+    def decode(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode raw offsets to image-space keypoint candidates.
+
+        Returns:
+            Tensor with shape (B, anchors * K, 4): x, y, confidence, keypoint_index.
+        """
+        raw = preds["kpts"]
+        feats = preds["feats"]
+        self._make_anchors(feats)
+        bs = raw.shape[0]
+        y = raw.view(bs, self.nkpt, 3, -1).permute(0, 3, 1, 2).contiguous()
+        xy = (y[..., :2].sigmoid() * 2.0 - 0.5 + self.anchors.reshape(1, -1, 1, 2)) * self.strides.reshape(
+            1, -1, 1, 1
+        )
+        conf = y[..., 2:3].sigmoid()
+        kpt_idx = torch.arange(self.nkpt, device=raw.device, dtype=raw.dtype).view(1, 1, self.nkpt, 1)
+        kpt_idx = kpt_idx.expand(bs, y.shape[1], self.nkpt, 1)
+        return torch.cat((xy, conf, kpt_idx), -1).view(bs, -1, 4)
+
+    def bias_init(self):
+        """Initialize low foreground confidence for dense keypoint candidates."""
+        for m in self.cv:
+            m[-1].bias.data[2::3] = math.log(0.01 / 0.99)
+
+
+class KeypointHeatmap(nn.Module):
+    """CenterNet-style keypoint-only head with multi-scale fusion, heatmap and local offsets."""
+
+    export = False
+    format = None
+    max_det = 300
+
+    def __init__(
+        self,
+        kpt_shape: tuple = (1, 3),
+        topk: int = 300,
+        hm_radius_add: int = 0,
+        hm_min_radius: int = 0,
+        ch: tuple = (),
+    ):
+        """Initialize lateral fusion plus heatmap and offset heads."""
+        super().__init__()
+        self.kpt_shape = kpt_shape
+        self.nkpt = kpt_shape[0]
+        self.ndim = kpt_shape[1]
+        self.no = self.nkpt * 3
+        self.nl = 1
+        self.stride = torch.zeros(self.nl)
+        self.topk = topk
+        self.hm_radius_add = int(hm_radius_add)
+        self.hm_min_radius = int(hm_min_radius)
+        ch = list(ch) if isinstance(ch, (list, tuple)) else [ch]
+        c = max(ch[0] // 4, 64, self.nkpt)
+        self.lateral = nn.ModuleList(Conv(x, c, 1) for x in ch)
+        self.refine = nn.Sequential(Conv(c, c, 3), Conv(c, c, 3))
+        self.hm = nn.Conv2d(c, self.nkpt, 1)
+        self.off = nn.Conv2d(c, self.nkpt * 2, 1)
+
+    def forward(self, x: list[torch.Tensor] | torch.Tensor) -> dict[str, torch.Tensor] | torch.Tensor | tuple:
+        """Return raw heatmap predictions during training, decoded peak candidates during inference."""
+        feats = list(x) if isinstance(x, (list, tuple)) else [x]
+        base = self.lateral[0](feats[0])
+        for i, feat in enumerate(feats[1:], 1):
+            base = base + F.interpolate(self.lateral[i](feat), size=base.shape[2:], mode="nearest")
+        feat = self.refine(base)
+        preds = {"hm": self.hm(feat), "offset": self.off(feat), "feats": feats}
+        if self.training:
+            return preds
+        decoded = self.decode(preds)
+        return decoded if self.export else (decoded, preds)
+
+    def decode(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode heatmap local maxima and offsets to image-space point candidates."""
+        hm = preds["hm"].sigmoid()
+        offset = preds["offset"].view(hm.shape[0], self.nkpt, 2, hm.shape[2], hm.shape[3])
+        pooled = F.max_pool2d(hm, kernel_size=3, stride=1, padding=1)
+        peaks = hm * (hm == pooled)
+        bs, nkpt, h, w = peaks.shape
+        total = nkpt * h * w
+        k = min(int(self.max_det), int(self.topk), total)
+        scores, inds = peaks.view(bs, -1).topk(k, dim=1)
+        kpt_idx = inds // (h * w)
+        spatial = inds % (h * w)
+        ys = spatial // w
+        xs = spatial % w
+        batch_idx = torch.arange(bs, device=hm.device).view(-1, 1).expand_as(inds)
+        off = offset[batch_idx, kpt_idx, :, ys, xs]
+        stride = self.stride.to(device=hm.device, dtype=hm.dtype).view(-1)[0]
+        xy = torch.stack((xs.to(hm.dtype) + off[..., 0], ys.to(hm.dtype) + off[..., 1]), -1) * stride
+        return torch.cat((xy, scores.unsqueeze(-1), kpt_idx.to(hm.dtype).unsqueeze(-1)), -1)
+
+    def bias_init(self):
+        """Initialize heatmap confidence low and offsets near the center of each cell."""
+        self.hm.bias.data.fill_(math.log(0.01 / 0.99))
+        self.off.bias.data.zero_()
 
 
 class Segment(Detect):

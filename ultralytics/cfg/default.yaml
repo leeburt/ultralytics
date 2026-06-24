@@ -107,6 +107,8 @@ pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 rle: 1.0 # (float) rle loss gain (pose tasks)
 angle: 1.0 # (float) oriented angle loss gain (obb tasks)
+hm_radius_add: 0 # (int) extra Gaussian radius cells for keypoint heatmap targets
+hm_min_radius: 0 # (int) minimum Gaussian radius cells for keypoint heatmap targets
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction

@@ -54,6 +54,8 @@ from ultralytics.nn.modules import (
     HGStem,
     ImagePoolingAttn,
     Index,
+    KeypointDetect,
+    KeypointHeatmap,
     LRPCHead,
     Pose,
     Pose26,
@@ -78,6 +80,8 @@ from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, SAFE_LOAD, SETTINGS, WIN
 from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2ELoss,
+    KeypointHeatmapLoss,
+    KeypointOnlyLoss,
     PoseLoss26,
     SemanticSegmentationLoss,
     v8ClassificationLoss,
@@ -295,6 +299,11 @@ class BaseModel(torch.nn.Module):
             m.stride = fn(m.stride)
             m.anchors = fn(m.anchors)
             m.strides = fn(m.strides)
+        elif isinstance(m, (KeypointDetect, KeypointHeatmap)):
+            m.stride = fn(m.stride)
+            if isinstance(m, KeypointDetect):
+                m.anchors = fn(m.anchors)
+                m.strides = fn(m.strides)
         return self
 
     def load(self, weights, verbose=True):
@@ -695,6 +704,47 @@ class PoseModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
         return E2ELoss(self, PoseLoss26) if getattr(self, "end2end", False) else v8PoseLoss(self)
+
+
+class KeypointModel(BaseModel):
+    """YOLO keypoint-only model that predicts dense keypoint candidates without boxes or classes."""
+
+    def __init__(self, cfg="yolo11n-keypoint.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+        """Initialize a keypoint-only model."""
+        super().__init__()
+        if not isinstance(cfg, dict):
+            cfg = yaml_model_load(cfg)
+        if any(data_kpt_shape) and list(data_kpt_shape) != list(cfg["kpt_shape"]):
+            LOGGER.info(f"Overriding model.yaml kpt_shape={cfg['kpt_shape']} with kpt_shape={data_kpt_shape}")
+            cfg["kpt_shape"] = data_kpt_shape
+        _initialize_yolo_model(self, cfg, ch, nc, verbose)
+
+        m = self.model[-1]
+        if isinstance(m, (KeypointDetect, KeypointHeatmap)):
+            self.kpt_shape = m.kpt_shape
+            s = 256
+            m.inplace = self.inplace
+            self.model.eval()
+            m.training = True
+            output = self.forward(torch.zeros(1, ch, s, s))
+            if isinstance(m, KeypointDetect):
+                m.stride = torch.tensor([s / x.shape[-2] for x in output["feats"]])
+            else:
+                m.stride = torch.tensor([s / output["hm"].shape[-2]])
+            self.stride = m.stride
+            self.model.train()
+            m.bias_init()
+        else:
+            self.stride = torch.Tensor([32])
+
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the KeypointModel."""
+        return KeypointHeatmapLoss(self) if isinstance(self.model[-1], KeypointHeatmap) else KeypointOnlyLoss(self)
 
 
 class ClassificationModel(BaseModel):
@@ -1926,6 +1976,14 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
+        elif m is KeypointDetect:
+            args.append([ch[x] for x in f] if isinstance(f, list) else [ch[f]])
+            c2 = ch[f[0]] if isinstance(f, list) else ch[f]
+        elif m is KeypointHeatmap:
+            if len(args) == 2:
+                args.extend([0, 0])
+            args.append([ch[x] for x in f] if isinstance(f, list) else [ch[f]])
+            c2 = ch[f[0]] if isinstance(f, list) else ch[f]
         elif m is SemanticSegment:
             args.append([ch[x] for x in f])  # nc, ch tuple
         elif m is v10Detect:
@@ -2014,6 +2072,8 @@ def guess_model_task(model):
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
+        if "keypointdetect" in m or "keypointheatmap" in m:
+            return "keypoint"
         if "detect" in m:
             return "detect"
         if "semanticsegment" in m:
@@ -2046,6 +2106,8 @@ def guess_model_task(model):
                 return "classify"
             elif isinstance(m, Pose):
                 return "pose"
+            elif isinstance(m, (KeypointDetect, KeypointHeatmap)):
+                return "keypoint"
             elif isinstance(m, OBB):
                 return "obb"
             elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
@@ -2062,6 +2124,8 @@ def guess_model_task(model):
             return "classify"
         elif "-pose" in model.stem or "pose" in model.parts:
             return "pose"
+        elif "-keypoint" in model.stem or "keypoint" in model.parts:
+            return "keypoint"
         elif "-obb" in model.stem or "obb" in model.parts:
             return "obb"
         elif "detect" in model.parts:
