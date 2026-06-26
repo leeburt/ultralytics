@@ -13,6 +13,11 @@ from ultralytics.nn.tasks import KeypointModel
 from ultralytics.utils import DEFAULT_CFG, RANK
 
 
+def _unwrap(model):
+    """Return the underlying nn.Module, unwrapping DDP if needed."""
+    return model.module if hasattr(model, "module") else model
+
+
 class KeypointTrainer(DetectionTrainer):
     """Trainer for keypoint-only models that do not predict boxes or classes."""
 
@@ -44,12 +49,13 @@ class KeypointTrainer(DetectionTrainer):
     def set_model_attributes(self):
         """Attach dataset metadata to the model."""
         super().set_model_attributes()
-        self.model.kpt_shape = self.data["kpt_shape"]
-        self.model.kpt_names = self.data.get("kpt_names") or {
-            i: [str(j) for j in range(self.model.kpt_shape[0])] for i in range(self.model.nc)
+        unwrapped = _unwrap(self.model)
+        unwrapped.kpt_shape = self.data["kpt_shape"]
+        unwrapped.kpt_names = self.data.get("kpt_names") or {
+            i: [str(j) for j in range(unwrapped.kpt_shape[0])] for i in range(unwrapped.nc)
         }
-        if isinstance(self.model.model[-1], KeypointHeatmap):
-            head = self.model.model[-1]
+        if isinstance(unwrapped.model[-1], KeypointHeatmap):
+            head = unwrapped.model[-1]
             if self.args.hm_radius_add or not getattr(head, "hm_radius_add", 0):
                 head.hm_radius_add = int(self.args.hm_radius_add)
             if self.args.hm_min_radius or not getattr(head, "hm_min_radius", 0):
@@ -57,7 +63,8 @@ class KeypointTrainer(DetectionTrainer):
 
     def get_validator(self):
         """Return validator for keypoint-only models."""
-        self.loss_names = ("hm_loss", "off_loss") if isinstance(self.model.model[-1], KeypointHeatmap) else ("kpt_loss", "kobj_loss")
+        unwrapped = _unwrap(self.model)
+        self.loss_names = ("hm_loss", "off_loss") if isinstance(unwrapped.model[-1], KeypointHeatmap) else ("kpt_loss", "kobj_loss")
         return yolo.keypoint.KeypointValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

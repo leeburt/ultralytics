@@ -7,9 +7,10 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from ultralytics.models.yolo.detect import DetectionValidator
-from ultralytics.utils import LOGGER, ops
+from ultralytics.utils import LOGGER, RANK, ops
 from ultralytics.utils.plotting import plot_images
 from .utils import radius_point_nms
 
@@ -50,6 +51,22 @@ class KeypointOnlyMetrics:
         gt = gt_points.detach().float().cpu()
         self.records.append((pred, gt))
         self.num_gt += int(gt.shape[0])
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        """Return gather-able stats dict for DDP."""
+        return {"records": self.records, "num_gt": self.num_gt}
+
+    @stats.setter
+    def stats(self, value: dict[str, Any]) -> None:
+        """Restore stats from gathered dict."""
+        self.records = value["records"]
+        self.num_gt = value["num_gt"]
+
+    def clear_stats(self) -> None:
+        """Clear accumulated stats after DDP gathering."""
+        self.records = []
+        self.num_gt = 0
 
     def mean_results(self):
         """Return metrics in display order."""
@@ -252,6 +269,30 @@ class KeypointValidator(DetectionValidator):
     def get_stats(self) -> dict[str, Any]:
         """Return validation statistics."""
         return self.metrics.results_dict
+
+    def gather_stats(self) -> None:
+        """Gather keypoint metrics from all DDP ranks."""
+        if RANK == 0:
+            gathered_stats = [None] * dist.get_world_size()
+            dist.gather_object(self.metrics.stats, gathered_stats, dst=0)
+            merged_records = []
+            merged_num_gt = 0
+            for s in gathered_stats:
+                merged_records.extend(s["records"])
+                merged_num_gt += s["num_gt"]
+            self.metrics.records = merged_records
+            self.metrics.num_gt = merged_num_gt
+            gathered_jdict = [None] * dist.get_world_size()
+            dist.gather_object(self.jdict, gathered_jdict, dst=0)
+            self.jdict = []
+            for jdict in gathered_jdict:
+                self.jdict.extend(jdict)
+            self.seen = len(self.dataloader.dataset)
+        elif RANK > 0:
+            dist.gather_object(self.metrics.stats, None, dst=0)
+            self.metrics.clear_stats()
+            dist.gather_object(self.jdict, None, dst=0)
+            self.jdict = []
 
     def get_desc(self) -> str:
         """Return validation progress header."""
