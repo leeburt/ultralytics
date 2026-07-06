@@ -2,7 +2,7 @@
 """
 ONNX inference for keypoint-only CenterNet-style heatmap model.
 
-Input:  (1, 3, 1280, 1280) float32, BGR
+Input:  (1, 3, 1280, 1280) float32, RGB, normalized to [0, 1]
 Output: (1, 300, 4) [x, y, score, class]
 
 Usage:
@@ -20,29 +20,41 @@ import numpy as np
 import onnxruntime as ort
 
 
-def letterbox(img: np.ndarray, new_shape: int = 1280, color: tuple = (114, 114, 114)) -> tuple[np.ndarray, float, int, int]:
-    """Resize and pad image to square, keeping aspect ratio. Returns (img, ratio, dw, dh)."""
-    h, w = img.shape[:2]
-    r = new_shape / max(h, w)
-    new_w, new_h = int(w * r), int(h * r)
-    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    dw = (new_shape - new_w) // 2
-    dh = (new_shape - new_h) // 2
-    top, bottom = dh, new_shape - new_h - dh
-    left, right = dw, new_shape - new_w - dw
+def letterbox(
+    img: np.ndarray,
+    new_shape: int = 1280,
+    color: tuple = (114, 114, 114),
+) -> tuple[np.ndarray, float, int, int]:
+    """Match Ultralytics validation resize + letterbox for a fixed square ONNX input."""
+    h0, w0 = img.shape[:2]
+    r0 = new_shape / max(h0, w0)
+    if r0 != 1:
+        new_w = min(int(np.ceil(w0 * r0)), new_shape)
+        new_h = min(int(np.ceil(h0 * r0)), new_shape)
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        new_h, new_w = h0, w0
+
+    dw = (new_shape - new_w) / 2
+    dh = (new_shape - new_h) / 2
+    top, bottom = round(dh - 0.1), round(dh + 0.1)
+    left, right = round(dw - 0.1), round(dw + 0.1)
     padded = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-    return padded, r, dw, dh
+
+    # Ultralytics ops.scale_coords uses ratio_pad[0][0] for both axes.
+    gain = new_h / h0
+    return padded, gain, left, top
 
 
 def preprocess(image_path: str | Path, imgsz: int = 1280) -> tuple[np.ndarray, float, int, int, np.ndarray]:
-    """Load and preprocess image: BGR letterbox → CHW float32 tensor."""
+    """Load and preprocess image: BGR letterbox -> RGB CHW normalized float32 tensor."""
     img = cv2.imread(str(image_path))
     if img is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
     orig_img = img.copy()
     img, ratio, dw, dh = letterbox(img, imgsz)
-    # HWC → CHW, uint8 → float32, keep BGR
-    img = img.transpose(2, 0, 1).astype(np.float32)
+    # HWC BGR -> CHW RGB, uint8 -> normalized float32
+    img = img[..., ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
     img = np.expand_dims(img, axis=0)
     return img, ratio, dw, dh, orig_img
 
@@ -79,7 +91,10 @@ def postprocess(
     conf_thr: float = 0.30,
     nms_radius: float = 8.0,
 ) -> list[dict]:
-    """Decode ONNX output points back to original image coordinates."""
+    """Decode ONNX output points back to original image coordinates.
+
+    Points that map outside the valid image region (letterbox padding area) are discarded.
+    """
     # Filter by confidence
     mask = output[0, :, 2] >= conf_thr
     pts = output[0, mask]
@@ -92,9 +107,9 @@ def postprocess(
         # Undo letterbox padding and scale
         x_orig = (x - dw) / ratio
         y_orig = (y - dh) / ratio
-        # Clip to image bounds
-        x_orig = max(0, min(x_orig, orig_w - 1))
-        y_orig = max(0, min(y_orig, orig_h - 1))
+        # Discard points that fall in padding area (outside valid image bounds)
+        if x_orig < 0 or x_orig >= orig_w or y_orig < 0 or y_orig >= orig_h:
+            continue
         points.append({"x": float(x_orig), "y": float(y_orig), "score": float(score), "class": int(cls)})
     return points
 

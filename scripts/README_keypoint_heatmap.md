@@ -56,7 +56,7 @@ yolo export \
 ```
 
 Output: `best.onnx` (9.1 MB)
-- Input: `(1, 3, 1280, 1280)` float32, BGR
+- Input: `(1, 3, 1280, 1280)` float32, RGB normalized to `[0, 1]`
 - Output: `(1, 300, 4)` — per-point `[x, y, score, class]`
 
 ## ONNX Inference
