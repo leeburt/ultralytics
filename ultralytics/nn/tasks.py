@@ -56,6 +56,7 @@ from ultralytics.nn.modules import (
     Index,
     KeypointDetect,
     KeypointHeatmap,
+    StructureHeatmap,
     LRPCHead,
     Pose,
     Pose26,
@@ -82,6 +83,7 @@ from ultralytics.utils.loss import (
     E2ELoss,
     KeypointHeatmapLoss,
     KeypointOnlyLoss,
+    StructureHeatmapLoss,
     PoseLoss26,
     SemanticSegmentationLoss,
     v8ClassificationLoss,
@@ -299,7 +301,7 @@ class BaseModel(torch.nn.Module):
             m.stride = fn(m.stride)
             m.anchors = fn(m.anchors)
             m.strides = fn(m.strides)
-        elif isinstance(m, (KeypointDetect, KeypointHeatmap)):
+        elif isinstance(m, (KeypointDetect, KeypointHeatmap, StructureHeatmap)):
             m.stride = fn(m.stride)
             if isinstance(m, KeypointDetect):
                 m.anchors = fn(m.anchors)
@@ -745,6 +747,44 @@ class KeypointModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the KeypointModel."""
         return KeypointHeatmapLoss(self) if isinstance(self.model[-1], KeypointHeatmap) else KeypointOnlyLoss(self)
+
+
+class StructureModel(BaseModel):
+    """YOLO structure model that predicts components, ports, and their polar relationships."""
+
+    def __init__(self, cfg="yolo11n-structure.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+        """Initialize a structure model."""
+        super().__init__()
+        if not isinstance(cfg, dict):
+            cfg = yaml_model_load(cfg)
+        if any(data_kpt_shape) and list(data_kpt_shape) != list(cfg["kpt_shape"]):
+            LOGGER.info(f"Overriding model.yaml kpt_shape={cfg['kpt_shape']} with kpt_shape={data_kpt_shape}")
+            cfg["kpt_shape"] = data_kpt_shape
+        _initialize_yolo_model(self, cfg, ch, nc, verbose)
+
+        m = self.model[-1]
+        if isinstance(m, StructureHeatmap):
+            self.kpt_shape = m.kpt_shape
+            s = 256
+            m.inplace = self.inplace
+            self.model.eval()
+            m.training = True
+            output = self.forward(torch.zeros(1, ch, s, s))
+            m.stride = torch.tensor([s / output["component_hm"].shape[-2]])
+            self.stride = m.stride
+            self.model.train()
+            m.bias_init()
+        else:
+            self.stride = torch.Tensor([32])
+
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the StructureModel."""
+        return StructureHeatmapLoss(self)
 
 
 class ClassificationModel(BaseModel):
@@ -1984,6 +2024,9 @@ def parse_model(d, ch, verbose=True):
                 args.extend([0, 0])
             args.append([ch[x] for x in f] if isinstance(f, list) else [ch[f]])
             c2 = ch[f[0]] if isinstance(f, list) else ch[f]
+        elif m is StructureHeatmap:
+            args.append([ch[x] for x in f] if isinstance(f, list) else [ch[f]])
+            c2 = ch[f[0]] if isinstance(f, list) else ch[f]
         elif m is SemanticSegment:
             args.append([ch[x] for x in f])  # nc, ch tuple
         elif m is v10Detect:
@@ -2108,6 +2151,8 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, (KeypointDetect, KeypointHeatmap)):
                 return "keypoint"
+            elif isinstance(m, StructureHeatmap):
+                return "structure"
             elif isinstance(m, OBB):
                 return "obb"
             elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
