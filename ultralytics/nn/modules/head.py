@@ -26,6 +26,7 @@ __all__ = (
     "Detect",
     "KeypointDetect",
     "KeypointHeatmap",
+    "StructureHeatmap",
     "Pose",
     "RTDETRDecoder",
     "Segment",
@@ -404,6 +405,133 @@ class KeypointHeatmap(nn.Module):
         """Initialize heatmap confidence low and offsets near the center of each cell."""
         self.hm.bias.data.fill_(math.log(0.01 / 0.99))
         self.off.bias.data.zero_()
+
+
+class StructureHeatmap(nn.Module):
+    """CenterNet-style structure prediction head with component/port heatmaps and polar port->component relationships."""
+
+    export = False
+    format = None
+    max_det = 1024
+
+    def __init__(
+        self,
+        kpt_shape=(25, 3),
+        topk_component=128,
+        topk_port=384,
+        ch=(),
+    ):
+        """Initialize lateral fusion plus heatmap, offset, and relation heads."""
+        super().__init__()
+        self.kpt_shape = kpt_shape
+        self.topk_component = topk_component
+        self.topk_port = topk_port
+        self.nl = 1
+        self.stride = torch.zeros(self.nl)
+        ch = list(ch) if isinstance(ch, (list, tuple)) else [ch]
+        c = max(ch[0] // 4, 64, 32)
+        self.lateral = nn.ModuleList(Conv(x, c, 1) for x in ch)
+        self.refine = nn.Sequential(Conv(c, c, 3), Conv(c, c, 3))
+
+        # Component head
+        self.component_hm = nn.Conv2d(c, 1, 1)
+        self.component_off = nn.Conv2d(c, 2, 1)
+
+        # Port head
+        self.port_hm = nn.Conv2d(c, 1, 1)
+        self.port_off = nn.Conv2d(c, 2, 1)
+
+        # Relation head (polar form: direction + rho)
+        self.direction = nn.Conv2d(c, 2, 1)  # cos/sin
+        self.rho = nn.Conv2d(c, 1, 1)  # log(1+distance)
+
+    def forward(self, x):
+        """Return raw predictions during training, decoded candidates during inference."""
+        feats = list(x) if isinstance(x, (list, tuple)) else [x]
+        base = self.lateral[0](feats[0])
+        for i, feat in enumerate(feats[1:], 1):
+            base = base + F.interpolate(self.lateral[i](feat), size=base.shape[2:], mode="nearest")
+        feat = self.refine(base)
+        preds = {
+            "component_hm": self.component_hm(feat),
+            "component_off": self.component_off(feat),
+            "port_hm": self.port_hm(feat),
+            "port_off": self.port_off(feat),
+            "direction": self.direction(feat),
+            "rho": self.rho(feat),
+            "feats": feats,
+        }
+        if self.training:
+            return preds
+        decoded = self.decode(preds)
+        return decoded if self.export else (decoded, preds)
+
+    def decode(self, preds):
+        """Decode heatmap maxima, offsets, and relations to image-space candidates."""
+        device = preds["component_hm"].device
+        dtype = preds["component_hm"].dtype
+        stride = self.stride.to(device=device, dtype=dtype).view(-1)[0]
+
+        # Decode components
+        component_hm = preds["component_hm"].sigmoid()
+        component_off = preds["component_off"]
+        component_pooled = F.max_pool2d(component_hm, kernel_size=3, stride=1, padding=1)
+        component_peaks = component_hm * (component_hm == component_pooled)
+        bs, _, h, w = component_peaks.shape
+        total = h * w
+        k_comp = min(int(self.max_det), int(self.topk_component), total)
+        comp_scores, comp_inds = component_peaks.view(bs, -1).topk(k_comp, dim=1)
+        comp_ys = comp_inds // w
+        comp_xs = comp_inds % w
+        comp_xy = torch.stack((comp_xs.to(dtype), comp_ys.to(dtype)), -1)
+        comp_off_gather = component_off.permute(0, 2, 3, 1).reshape(bs, -1, 2)
+        comp_off = comp_off_gather.gather(1, comp_inds.unsqueeze(-1).expand(-1, -1, 2))
+        comp_xy = (comp_xy + comp_off) * stride
+
+        # Decode ports
+        port_hm = preds["port_hm"].sigmoid()
+        port_off = preds["port_off"]
+        direction = preds["direction"]
+        rho = preds["rho"]
+        port_pooled = F.max_pool2d(port_hm, kernel_size=3, stride=1, padding=1)
+        port_peaks = port_hm * (port_hm == port_pooled)
+        k_port = min(int(self.max_det), int(self.topk_port), total)
+        port_scores, port_inds = port_peaks.view(bs, -1).topk(k_port, dim=1)
+        port_ys = port_inds // w
+        port_xs = port_inds % w
+        port_xy = torch.stack((port_xs.to(dtype), port_ys.to(dtype)), -1)
+        port_off_gather = port_off.permute(0, 2, 3, 1).reshape(bs, -1, 2)
+        port_off = port_off_gather.gather(1, port_inds.unsqueeze(-1).expand(-1, -1, 2))
+        port_xy = (port_xy + port_off) * stride
+
+        # Gather relation predictions at port locations
+        dir_gather = direction.permute(0, 2, 3, 1).reshape(bs, -1, 2)
+        rho_gather = rho.permute(0, 2, 3, 1).reshape(bs, -1, 1)
+        port_dir = dir_gather.gather(1, port_inds.unsqueeze(-1).expand(-1, -1, 2))
+        port_rho = rho_gather.gather(1, port_inds.unsqueeze(-1))
+
+        # Compute predicted component endpoints from ports
+        port_dir_norm = port_dir / (port_dir.norm(dim=-1, keepdim=True) + 1e-8)
+        distance = torch.expm1(F.softplus(port_rho))  # exp(rho) - 1
+        pred_component_xy = port_xy + distance * stride * port_dir_norm
+
+        # Format output
+        result = []
+        for b in range(bs):
+            result.append({
+                "components": torch.cat((comp_xy[b], comp_scores[b].unsqueeze(-1)), -1),
+                "ports": torch.cat((port_xy[b], port_scores[b].unsqueeze(-1), pred_component_xy[b], port_dir[b], port_rho[b]), -1),
+            })
+        return result
+
+    def bias_init(self):
+        """Initialize heatmap confidence low and offsets near zero."""
+        self.component_hm.bias.data.fill_(math.log(0.01 / 0.99))
+        self.port_hm.bias.data.fill_(math.log(0.01 / 0.99))
+        self.component_off.bias.data.zero_()
+        self.port_off.bias.data.zero_()
+        self.direction.bias.data.zero_()
+        self.rho.bias.data.zero_()
 
 
 class Segment(Detect):
