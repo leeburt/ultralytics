@@ -532,6 +532,262 @@ class KeypointHeatmapLoss:
         return min(r1, r2, r3)
 
 
+class StructureHeatmapLoss:
+    """CenterNet-style structure loss with component/port heatmaps and polar port->component relationships."""
+
+    def __init__(self, model):
+        """Initialize structure loss state from the model head."""
+        self.head = model.model[-1]
+        self.component_hm_weight = 1.0
+        self.component_off_weight = 1.0
+        self.port_hm_weight = 1.0
+        self.port_off_weight = 1.0
+        self.dir_weight = 0.5
+        self.rho_weight = 0.5
+        self.endpoint_weight = 0.25
+        self.ramp_epochs = 5
+        self.current_epoch = 0
+
+    def set_epoch(self, epoch):
+        """Set current epoch for loss weight ramp-up."""
+        self.current_epoch = epoch
+
+    def __call__(self, preds, batch):
+        """Compute structure losses."""
+        if isinstance(preds, (tuple, list)):
+            preds = preds[1]
+        device = preds["component_hm"].device
+        dtype = preds["component_hm"].dtype
+        bs, _, h, w = preds["component_hm"].shape
+        stride = self.head.stride.to(device=device, dtype=dtype).view(-1)[0]
+
+        # Initialize targets
+        target_component_hm = torch.zeros_like(preds["component_hm"])
+        target_component_off = torch.zeros((bs, 2, h, w), device=device, dtype=dtype)
+        component_off_mask = torch.zeros((bs, h, w), device=device, dtype=torch.bool)
+
+        target_port_hm = torch.zeros_like(preds["port_hm"])
+        target_port_off = torch.zeros((bs, 2, h, w), device=device, dtype=dtype)
+        port_off_mask = torch.zeros((bs, h, w), device=device, dtype=torch.bool)
+
+        target_dir = torch.zeros((bs, 2, h, w), device=device, dtype=dtype)
+        target_rho = torch.zeros((bs, 1, h, w), device=device, dtype=dtype)
+        relation_mask = torch.zeros((bs, h, w), device=device, dtype=torch.bool)
+
+        # Collision counters for stats
+        component_collisions = 0
+        port_collisions = 0
+
+        # Build targets from keypoint annotations
+        keypoints = batch.get("keypoints")
+        batch_idx = batch.get("batch_idx")
+        bboxes = batch.get("bboxes")
+        if keypoints is not None and batch_idx is not None and keypoints.numel():
+            keypoints = keypoints.to(device=device, dtype=dtype)
+            batch_idx = batch_idx.to(device=device, dtype=torch.long).view(-1)
+            bboxes = bboxes.to(device=device, dtype=dtype) if bboxes is not None and bboxes.numel() else None
+            imgsz = torch.tensor((h, w), device=device, dtype=dtype) * stride
+
+            for i in range(keypoints.shape[0]):
+                b = int(batch_idx[i].item())
+                if b < 0 or b >= bs:
+                    continue
+
+                # Keypoint 0 is component center, keypoints 1-24 are ports
+                obj_kpts = keypoints[i]
+                component_kpt = obj_kpts[0]
+                port_kpts = obj_kpts[1:]
+
+                # Draw component center
+                if component_kpt[2] > 0:
+                    comp_xy_abs = component_kpt[:2].clone()
+                    comp_xy_abs[0] *= imgsz[1]
+                    comp_xy_abs[1] *= imgsz[0]
+                    comp_xy = comp_xy_abs / stride
+                    cx = comp_xy[0].clamp(0, max(float(w) - 1e-4, 0.0))
+                    cy = comp_xy[1].clamp(0, max(float(h) - 1e-4, 0.0))
+                    cxi, cyi = int(cx.floor().item()), int(cy.floor().item())
+
+                    # Compute radius from bbox if available
+                    radius = 2  # fallback
+                    if bboxes is not None and i < bboxes.shape[0]:
+                        box_w = float((bboxes[i, 2] * imgsz[1] / stride).clamp(min=0).item())
+                        box_h = float((bboxes[i, 3] * imgsz[0] / stride).clamp(min=0).item())
+                        radius = max(1, min(8, int(self._gaussian_radius((box_h, box_w)))))
+
+                    self._draw_gaussian(target_component_hm[b, 0], cxi, cyi, radius)
+                    if component_off_mask[b, cyi, cxi]:
+                        component_collisions += 1
+                    else:
+                        target_component_off[b, 0, cyi, cxi] = cx - cxi
+                        target_component_off[b, 1, cyi, cxi] = cy - cyi
+                        component_off_mask[b, cyi, cxi] = True
+
+                # Draw ports and their relation to component center
+                for port_kpt in port_kpts:
+                    if port_kpt[2] > 0:
+                        port_xy_abs = port_kpt[:2].clone()
+                        port_xy_abs[0] *= imgsz[1]
+                        port_xy_abs[1] *= imgsz[0]
+                        port_xy = port_xy_abs / stride
+                        px = port_xy[0].clamp(0, max(float(w) - 1e-4, 0.0))
+                        py = port_xy[1].clamp(0, max(float(h) - 1e-4, 0.0))
+                        pxi, pyi = int(px.floor().item()), int(py.floor().item())
+
+                        # Port heatmap uses fixed small radius
+                        self._draw_gaussian(target_port_hm[b, 0], pxi, pyi, 1)
+                        if port_off_mask[b, pyi, pxi]:
+                            port_collisions += 1
+                        else:
+                            target_port_off[b, 0, pyi, pxi] = px - pxi
+                            target_port_off[b, 1, pyi, pxi] = py - pyi
+                            port_off_mask[b, pyi, pxi] = True
+
+                        # Relation target (only if component is visible)
+                        if component_kpt[2] > 0:
+                            delta_xy = comp_xy - port_xy  # in feature cells
+                            distance_gt = delta_xy.norm()
+                            if distance_gt >= 0.5:  # stable direction threshold
+                                direction_gt = delta_xy / distance_gt
+                                rho_gt = torch.log1p(distance_gt)  # log(1+d)
+                                if not relation_mask[b, pyi, pxi]:
+                                    target_dir[b, :, pyi, pxi] = direction_gt
+                                    target_rho[b, 0, pyi, pxi] = rho_gt
+                                    relation_mask[b, pyi, pxi] = True
+
+        # Compute losses
+        component_hm_loss = self._focal_loss(preds["component_hm"], target_component_hm)
+        port_hm_loss = self._focal_loss(preds["port_hm"], target_port_hm)
+
+        if component_off_mask.any():
+            component_off_loss = F.l1_loss(
+                preds["component_off"].permute(0, 2, 3, 1)[component_off_mask],
+                target_component_off.permute(0, 2, 3, 1)[component_off_mask],
+                reduction="sum",
+            )
+            component_off_loss = component_off_loss / (component_off_mask.sum().clamp(min=1).to(dtype) * 2.0)
+        else:
+            component_off_loss = preds["component_off"].sum() * 0.0
+
+        if port_off_mask.any():
+            port_off_loss = F.l1_loss(
+                preds["port_off"].permute(0, 2, 3, 1)[port_off_mask],
+                target_port_off.permute(0, 2, 3, 1)[port_off_mask],
+                reduction="sum",
+            )
+            port_off_loss = port_off_loss / (port_off_mask.sum().clamp(min=1).to(dtype) * 2.0)
+        else:
+            port_off_loss = preds["port_off"].sum() * 0.0
+
+        # Polar relation losses
+        dir_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        rho_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        endpoint_loss = torch.tensor(0.0, device=device, dtype=dtype)
+
+        if relation_mask.any():
+            # Direction loss (cosine similarity)
+            pred_dir = preds["direction"].permute(0, 2, 3, 1)[relation_mask]
+            gt_dir = target_dir.permute(0, 2, 3, 1)[relation_mask]
+            pred_dir_norm = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + 1e-8)
+            dir_loss = 1.0 - (pred_dir_norm * gt_dir).sum(dim=-1).mean()
+
+            # Rho loss (smooth L1)
+            pred_rho = preds["rho"].permute(0, 2, 3, 1)[relation_mask]
+            gt_rho = target_rho.permute(0, 2, 3, 1)[relation_mask]
+            rho_loss = F.smooth_l1_loss(pred_rho, gt_rho)
+
+            # Endpoint loss (reconstructed component center)
+            pred_distance = torch.expm1(F.softplus(pred_rho))  # exp(rho) - 1
+            pred_delta = pred_distance * pred_dir_norm
+            # gt_delta in feature cells
+            gt_distance = torch.expm1(gt_rho)
+            gt_delta = gt_distance * gt_dir
+            # Normalize by gt distance for scale-invariance
+            norm = gt_distance.clamp(min=1.0)
+            endpoint_loss = F.smooth_l1_loss(pred_delta / norm, gt_delta / norm)
+
+        # Ramp up relation loss weights
+        ramp_factor = min(1.0, self.current_epoch / max(1, self.ramp_epochs))
+        dir_weight = self.dir_weight * ramp_factor
+        rho_weight = self.rho_weight * ramp_factor
+        endpoint_weight = self.endpoint_weight * ramp_factor
+
+        # Total loss
+        loss = (
+            component_hm_loss * self.component_hm_weight
+            + component_off_loss * self.component_off_weight
+            + port_hm_loss * self.port_hm_weight
+            + port_off_loss * self.port_off_weight
+            + dir_loss * dir_weight
+            + rho_loss * rho_weight
+            + endpoint_loss * endpoint_weight
+        )
+
+        loss_items = torch.stack((
+            component_hm_loss * self.component_hm_weight,
+            component_off_loss * self.component_off_weight,
+            port_hm_loss * self.port_hm_weight,
+            port_off_loss * self.port_off_weight,
+            dir_loss * dir_weight,
+            rho_loss * rho_weight,
+            endpoint_loss * endpoint_weight,
+        ))
+        return loss * bs, loss_items.detach()
+
+    @staticmethod
+    def _focal_loss(pred, gt):
+        """Modified focal loss used by CenterNet."""
+        pred = pred.sigmoid().clamp(1e-4, 1 - 1e-4)
+        pos = gt.eq(1)
+        neg = gt.lt(1)
+        neg_weights = (1 - gt).pow(4)
+        pos_loss = -(pred.log() * (1 - pred).pow(2) * pos).sum()
+        neg_loss = -((1 - pred).log() * pred.pow(2) * neg_weights * neg).sum()
+        num_pos = pos.sum().clamp(min=1)
+        return (pos_loss + neg_loss) / num_pos
+
+    @staticmethod
+    def _draw_gaussian(heatmap, x, y, radius):
+        """Draw a small Gaussian peak on a heatmap in-place."""
+        diameter = 2 * radius + 1
+        xs = torch.arange(diameter, device=heatmap.device, dtype=heatmap.dtype) - radius
+        yy, xx = torch.meshgrid(xs, xs, indexing="ij")
+        gaussian = torch.exp(-(xx**2 + yy**2) / (2 * (diameter / 6) ** 2))
+
+        height, width = heatmap.shape
+        left, right = min(x, radius), min(width - x - 1, radius)
+        top, bottom = min(y, radius), min(height - y - 1, radius)
+        patch = heatmap[y - top : y + bottom + 1, x - left : x + right + 1]
+        gpatch = gaussian[radius - top : radius + bottom + 1, radius - left : radius + right + 1]
+        torch.maximum(patch, gpatch, out=patch)
+
+    @staticmethod
+    def _gaussian_radius(det_size, min_overlap=0.7):
+        """Compute CenterNet Gaussian radius from object size on the output feature map."""
+        height, width = det_size
+        if height <= 0 or width <= 0:
+            return 0.0
+
+        a1 = 1.0
+        b1 = height + width
+        c1 = width * height * (1 - min_overlap) / (1 + min_overlap)
+        sq1 = math.sqrt(max(0.0, b1**2 - 4 * a1 * c1))
+        r1 = (b1 + sq1) / 2
+
+        a2 = 4.0
+        b2 = 2 * (height + width)
+        c2 = (1 - min_overlap) * width * height
+        sq2 = math.sqrt(max(0.0, b2**2 - 4 * a2 * c2))
+        r2 = (b2 + sq2) / 2
+
+        a3 = 4 * min_overlap
+        b3 = -2 * min_overlap * (height + width)
+        c3 = (min_overlap - 1) * width * height
+        sq3 = math.sqrt(max(0.0, b3**2 - 4 * a3 * c3))
+        r3 = (b3 + sq3) / 2
+        return min(r1, r2, r3)
+
+
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
