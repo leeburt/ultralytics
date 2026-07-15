@@ -607,6 +607,7 @@ class StructureHeatmapLoss:
                     cx = comp_xy[0].clamp(0, max(float(w) - 1e-4, 0.0))
                     cy = comp_xy[1].clamp(0, max(float(h) - 1e-4, 0.0))
                     cxi, cyi = int(cx.floor().item()), int(cy.floor().item())
+                    cxi, cyi = min(cxi, w - 1), min(cyi, h - 1)
 
                     # Compute radius from bbox if available
                     radius = 2  # fallback
@@ -633,6 +634,7 @@ class StructureHeatmapLoss:
                         px = port_xy[0].clamp(0, max(float(w) - 1e-4, 0.0))
                         py = port_xy[1].clamp(0, max(float(h) - 1e-4, 0.0))
                         pxi, pyi = int(px.floor().item()), int(py.floor().item())
+                        pxi, pyi = min(pxi, w - 1), min(pyi, h - 1)
 
                         # Port heatmap uses fixed small radius
                         self._draw_gaussian(target_port_hm[b, 0], pxi, pyi, 1)
@@ -655,9 +657,9 @@ class StructureHeatmapLoss:
                                     target_rho[b, 0, pyi, pxi] = rho_gt
                                     relation_mask[b, pyi, pxi] = True
 
-        # Compute losses
-        component_hm_loss = self._focal_loss(preds["component_hm"], target_component_hm)
-        port_hm_loss = self._focal_loss(preds["port_hm"], target_port_hm)
+        # Compute losses with NaN protection
+        component_hm_loss = self._focal_loss(preds["component_hm"], target_component_hm).nan_to_num(0.0).clamp(0.0, 100.0)
+        port_hm_loss = self._focal_loss(preds["port_hm"], target_port_hm).nan_to_num(0.0).clamp(0.0, 100.0)
 
         if component_off_mask.any():
             component_off_loss = F.l1_loss(
@@ -744,7 +746,8 @@ class StructureHeatmapLoss:
         pos_loss = -(pred.log() * (1 - pred).pow(2) * pos).sum()
         neg_loss = -((1 - pred).log() * pred.pow(2) * neg_weights * neg).sum()
         num_pos = pos.sum().clamp(min=1)
-        return (pos_loss + neg_loss) / num_pos
+        loss = (pos_loss + neg_loss) / num_pos
+        return loss.nan_to_num(0.0)
 
     @staticmethod
     def _draw_gaussian(heatmap, x, y, radius):

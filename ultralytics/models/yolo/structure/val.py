@@ -108,9 +108,9 @@ class StructureMetrics:
     def _match_points(pred, gt, threshold):
         """Match predicted points to GT points with distance threshold."""
         if pred.numel() == 0:
-            return [], list(range(gt.shape[0]))
+            return [], [], list(range(gt.shape[0]))
         if gt.numel() == 0:
-            return list(range(pred.shape[0])), []
+            return [], list(range(pred.shape[0])), []
 
         # Compute distance matrix
         pred_xy = pred[:, :2]
@@ -134,8 +134,8 @@ class StructureMetrics:
                     best_gt_idx = gt_idx
             if best_gt_idx >= 0:
                 matched_gt.add(best_gt_idx)
-                matched_pred.add(pred_idx)
-                matches.append((pred_idx, best_gt_idx))
+                matched_pred.add(int(pred_idx))
+                matches.append((int(pred_idx), best_gt_idx))
 
         fp = [i for i in range(pred.shape[0]) if i not in matched_pred]
         fn = [i for i in range(gt.shape[0]) if i not in matched_gt]
@@ -247,8 +247,9 @@ class StructureMetrics:
                     else:
                         link_fp += 1
 
-            # Count FN links
-            link_fn += self.num_gt_links - link_tp if self.num_gt_links > link_tp else 0
+            # Count FN links (per-image, not global)
+            gt_link_count = len(gt_port_to_comp)
+            link_fn += max(0, gt_link_count - link_tp)
 
             # Check strict object recall: all ports of component must be correctly linked
             for comp_idx in gt_comp_port_counts:
@@ -349,8 +350,8 @@ class StructureValidator(DetectionValidator):
             # Build links by matching port-predicted-component to nearest detected component
             links = []
             if ports.shape[0] and components.shape[0]:
-                port_pred_comp = ports[:, 3:5]
-                comp_xy = components[:, :2]
+                port_pred_comp = ports[:, 3:5].float()
+                comp_xy = components[:, :2].float()
                 dists = torch.cdist(port_pred_comp, comp_xy)
 
                 for port_idx in range(ports.shape[0]):
@@ -374,6 +375,10 @@ class StructureValidator(DetectionValidator):
                 "links": links,
             })
         return outputs
+
+    def plot_predictions(self, batch, preds, batch_idx):
+        """Override to handle structure-specific prediction format (no-op)."""
+        pass
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
         """Prepare ground-truth for a batch image."""

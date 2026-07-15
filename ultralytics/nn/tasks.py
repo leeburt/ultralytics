@@ -2117,6 +2117,8 @@ def guess_model_task(model):
             return "classify"
         if "keypointdetect" in m or "keypointheatmap" in m:
             return "keypoint"
+        if "structureheatmap" in m:
+            return "structure"
         if "detect" in m:
             return "detect"
         if "semanticsegment" in m:

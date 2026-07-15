@@ -79,13 +79,13 @@ class StructureTrainer(DetectionTrainer):
             data["kpt_shape"] = [25, 3]  # Default: 1 component + 24 ports
         return data
 
-    def _do_train(self, world_size=1):
-        """Override to pass epoch to loss criterion."""
-        for epoch in range(self.start_epoch, self.epochs):
-            self.epoch = epoch
-            # Update loss epoch for ramp-up
-            unwrapped = _unwrap(self.model)
-            if hasattr(unwrapped, "criterion") and hasattr(unwrapped.criterion, "set_epoch"):
-                unwrapped.criterion.set_epoch(epoch)
-            # Continue with normal training
-            super()._do_train(world_size)
+    def _setup_train(self):
+        """Setup training and register callback to sync loss epoch."""
+        super()._setup_train()
+
+        def _set_epoch(trainer):
+            uw = _unwrap(trainer.model)
+            if hasattr(uw, "criterion") and hasattr(uw.criterion, "set_epoch"):
+                uw.criterion.set_epoch(trainer.epoch)
+
+        self.callbacks["on_train_epoch_start"].append(_set_epoch)

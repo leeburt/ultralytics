@@ -18,6 +18,7 @@ from ultralytics.nn.tasks import (
     PoseModel,
     SegmentationModel,
     SemanticSegmentationModel,
+    StructureModel,
     WorldModel,
     YOLOEModel,
     YOLOESegModel,
@@ -129,6 +130,12 @@ class YOLO(Model):
                 "trainer": yolo.semantic.SemanticSegmentationTrainer,
                 "validator": yolo.semantic.SemanticSegmentationValidator,
                 "predictor": yolo.semantic.SemanticSegmentationPredictor,
+            },
+            "structure": {
+                "model": StructureModel,
+                "trainer": yolo.structure.StructureTrainer,
+                "validator": yolo.structure.StructureValidator,
+                "predictor": yolo.structure.StructurePredictor,
             },
         }
 

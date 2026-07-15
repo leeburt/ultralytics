@@ -57,7 +57,7 @@ SOLUTION_MAP = {
 
 # Define valid tasks and modes
 MODES = frozenset({"train", "val", "predict", "export", "track", "benchmark"})
-TASKS = frozenset({"detect", "segment", "classify", "pose", "keypoint", "obb", "semantic"})
+TASKS = frozenset({"detect", "segment", "classify", "pose", "keypoint", "obb", "semantic", "structure"})
 TASK2DATA = {
     "detect": "coco8.yaml",
     "segment": "coco8-seg.yaml",
@@ -66,6 +66,7 @@ TASK2DATA = {
     "keypoint": "coco8-pose.yaml",
     "obb": "dota8.yaml",
     "semantic": "cityscapes8.yaml",
+    "structure": "device_ports.yaml",
 }
 TASK2CALIBRATIONDATA = {
     "detect": "coco128.yaml",
@@ -84,6 +85,7 @@ TASK2MODEL = {
     "keypoint": "yolo11n-keypoint.yaml",
     "obb": "yolo26n-obb.pt",
     "semantic": "yolo26n-sem.pt",
+    "structure": "yolo11n-structure.yaml",
 }
 TASK2METRIC = {
     "detect": "metrics/mAP50-95(B)",
@@ -93,6 +95,7 @@ TASK2METRIC = {
     "keypoint": "metrics/center_5px_F1(K)",
     "obb": "metrics/mAP50-95(B)",
     "semantic": "metrics/mIoU",
+    "structure": "fitness",
 }
 
 ARGV = sys.argv or ["", ""]  # sometimes sys.argv = []
