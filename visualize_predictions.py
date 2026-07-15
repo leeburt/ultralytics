@@ -55,9 +55,10 @@ def draw_ground_truth(img, gt_components, gt_ports, gt_links):
 
 def main():
     model_path = "runs/structure/runs/structure/train/weights/best.pt"
+    device = torch.device("cuda:1")
     print(f"Loading: {model_path}")
-    model, ckpt = load_checkpoint(model_path, device="cuda:3")
-    model = model.cuda().eval()
+    model, ckpt = load_checkpoint(model_path, device=device)
+    model = model.eval()
 
     val_img_dir = Path("datasets/device_ports/images/val")
     val_label_dir = Path("datasets/device_ports/labels/val")
@@ -98,7 +99,7 @@ def main():
         img_640 = cv2.resize(img, (640, 640))
         t = torch.from_numpy(img_640).float().permute(2, 0, 1).unsqueeze(0) / 255.0
         with torch.no_grad():
-            pd = model(t.cuda())[0][0]
+            pd = model(t.to(device))[0][0]
 
         components = pd["components"]
         ports = pd["ports"]
