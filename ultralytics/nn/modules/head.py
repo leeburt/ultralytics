@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
+from ultralytics.utils.ops import decode_port_distance
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
@@ -512,7 +513,7 @@ class StructureHeatmap(nn.Module):
 
         # Compute predicted component endpoints from ports
         port_dir_norm = port_dir / (port_dir.norm(dim=-1, keepdim=True) + 1e-8)
-        distance = torch.expm1(F.softplus(port_rho))  # exp(rho) - 1
+        distance = decode_port_distance(port_rho)
         pred_component_xy = port_xy + distance * stride * port_dir_norm
 
         # Format output

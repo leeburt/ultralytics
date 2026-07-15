@@ -15,6 +15,17 @@ import torch.nn.functional as F
 from ultralytics.utils import NOT_MACOS14
 
 
+def encode_port_distance(distance: torch.Tensor) -> torch.Tensor:
+    """Map a non-negative feature-space distance to the raw rho decoded by ``decode_port_distance``."""
+    log_distance = torch.log1p(distance).clamp_min(torch.finfo(distance.dtype).eps)
+    return log_distance + torch.log(-torch.expm1(-log_distance))
+
+
+def decode_port_distance(raw_rho: torch.Tensor) -> torch.Tensor:
+    """Decode raw rho logits to non-negative feature-space port-to-component distances."""
+    return torch.expm1(F.softplus(raw_rho))
+
+
 class Profile(contextlib.ContextDecorator):
     """Ultralytics Profile class for timing code execution.
 

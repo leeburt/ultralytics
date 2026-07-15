@@ -12,7 +12,7 @@ import torch.distributed as dist
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.utils import LOGGER, RANK, ops
 from ultralytics.utils.plotting import plot_images
-from .utils import radius_point_nms
+from .utils import associate_ports_to_components, radius_point_nms, scale_link_geometry
 
 
 class StructureMetrics:
@@ -157,6 +157,7 @@ class StructureMetrics:
         link_fp = 0
         link_fn = 0
         correct_associations = 0
+        association_total = 0
         angle_errors = []
         endpoint_errors = []
         strict_object_count = 0
@@ -199,6 +200,7 @@ class StructureMetrics:
             total_objects += len(gt_comp_port_counts)
 
             # Evaluate links from predictions
+            image_link_tp = 0
             if pred_link is not None:
                 for link in pred_link:
                     pred_port_idx = int(link[0])
@@ -213,9 +215,11 @@ class StructureMetrics:
                             gt_comp_idx = gt_port_to_comp[gt_port_idx]
                             # Check if predicted component is matched to GT component
                             if pred_comp_idx in matched_pred_comp_to_gt_comp:
+                                association_total += 1
                                 matched_gt_comp_idx = matched_pred_comp_to_gt_comp[pred_comp_idx]
                                 if matched_gt_comp_idx == gt_comp_idx:
                                     link_tp += 1
+                                    image_link_tp += 1
                                     correct_associations += 1
                                     gt_comp_correct_port_counts[gt_comp_idx] = gt_comp_correct_port_counts.get(gt_comp_idx, 0) + 1
                                     # Compute angle error if available
@@ -249,7 +253,7 @@ class StructureMetrics:
 
             # Count FN links (per-image, not global)
             gt_link_count = len(gt_port_to_comp)
-            link_fn += max(0, gt_link_count - link_tp)
+            link_fn += max(0, gt_link_count - image_link_tp)
 
             # Check strict object recall: all ports of component must be correctly linked
             for comp_idx in gt_comp_port_counts:
@@ -267,7 +271,7 @@ class StructureMetrics:
         port_prec, port_rec, port_f1 = compute_f1(port_tp, port_fp, port_fn)
         link_prec, link_rec, link_f1 = compute_f1(link_tp, link_fp, link_fn)
 
-        assoc_acc = correct_associations / max(link_tp, 1) if link_tp > 0 else 0.0
+        assoc_acc = correct_associations / association_total if association_total else 0.0
         angle_mae = np.mean(angle_errors) if angle_errors else 0.0
         endpoint_mae = np.mean(endpoint_errors) if endpoint_errors else 0.0
         strict_recall = strict_object_count / max(total_objects, 1) if total_objects > 0 else 0.0
@@ -347,27 +351,7 @@ class StructureValidator(DetectionValidator):
             if ports.shape[0]:
                 ports = radius_point_nms(ports, self.port_nms_radius, self.args.max_det)
 
-            # Build links by matching port-predicted-component to nearest detected component
-            links = []
-            if ports.shape[0] and components.shape[0]:
-                port_pred_comp = ports[:, 3:5].float()
-                comp_xy = components[:, :2].float()
-                dists = torch.cdist(port_pred_comp, comp_xy)
-
-                for port_idx in range(ports.shape[0]):
-                    min_dist, comp_idx = dists[port_idx].min(dim=0)
-                    # Tolerance: min(8 cells, max(2 cells, 0.15 * distance))
-                    port_to_pred_comp_dist = torch.norm(ports[port_idx, 3:5] - ports[port_idx, :2])
-                    tolerance = min(8.0 * 4.0, max(2.0 * 4.0, 0.15 * float(port_to_pred_comp_dist)))
-                    if min_dist <= tolerance:
-                        link_score = torch.sqrt(ports[port_idx, 2] * components[comp_idx, 2])
-                        link_score *= torch.exp(-0.5 * (min_dist / tolerance) ** 2)
-                        links.append(torch.tensor([port_idx, comp_idx, link_score, ports[port_idx, 5], ports[port_idx, 6], ports[port_idx, 3], ports[port_idx, 4]], device=device))
-
-            if links:
-                links = torch.stack(links)
-            else:
-                links = torch.zeros((0, 7), device=device)
+            ports, links = associate_ports_to_components(components, ports)
 
             outputs.append({
                 "components": components,
@@ -467,8 +451,8 @@ class StructureValidator(DetectionValidator):
             else:
                 pred_ports_scaled = pred_ports.new_zeros((0, 8))
 
-            # Links reference component/port indices which don't need scaling
-            self.metrics.update(pred_components_scaled, pred_ports_scaled, pred_links, gt["components"], gt["ports"], gt["links"])
+            pred_links_scaled = scale_link_geometry(pred_links, pred_ports_scaled)
+            self.metrics.update(pred_components_scaled, pred_ports_scaled, pred_links_scaled, gt["components"], gt["ports"], gt["links"])
 
     def get_stats(self) -> dict[str, Any]:
         """Return validation statistics."""

@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import CITYSCAPES_WEIGHT, OKS_SIGMA, RLE_WEIGHT
-from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
+from ultralytics.utils.ops import crop_mask, decode_port_distance, encode_port_distance, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
@@ -651,7 +651,7 @@ class StructureHeatmapLoss:
                             distance_gt = delta_xy.norm()
                             if distance_gt >= 0.5:  # stable direction threshold
                                 direction_gt = delta_xy / distance_gt
-                                rho_gt = torch.log1p(distance_gt)  # log(1+d)
+                                rho_gt = encode_port_distance(distance_gt)
                                 if not relation_mask[b, pyi, pxi]:
                                     target_dir[b, :, pyi, pxi] = direction_gt
                                     target_rho[b, 0, pyi, pxi] = rho_gt
@@ -699,10 +699,10 @@ class StructureHeatmapLoss:
             rho_loss = F.smooth_l1_loss(pred_rho, gt_rho)
 
             # Endpoint loss (reconstructed component center)
-            pred_distance = torch.expm1(F.softplus(pred_rho))  # exp(rho) - 1
+            pred_distance = decode_port_distance(pred_rho)
             pred_delta = pred_distance * pred_dir_norm
             # gt_delta in feature cells
-            gt_distance = torch.expm1(gt_rho)
+            gt_distance = decode_port_distance(gt_rho)
             gt_delta = gt_distance * gt_dir
             # Normalize by gt distance for scale-invariance
             norm = gt_distance.clamp(min=1.0)

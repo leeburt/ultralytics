@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import torch
 from pathlib import Path
-from ultralytics.models.yolo.structure.utils import radius_point_nms
+from ultralytics.models.yolo.structure.utils import associate_ports_to_components, radius_point_nms
 from ultralytics.nn.tasks import load_checkpoint
 
 
@@ -56,7 +56,7 @@ def draw_ground_truth(img, gt_components, gt_ports, gt_links):
 def main():
     model_path = "runs/structure/runs/structure/train/weights/best.pt"
     print(f"Loading: {model_path}")
-    model, ckpt = load_checkpoint(model_path, device="cuda:0")
+    model, ckpt = load_checkpoint(model_path, device="cuda:3")
     model = model.cuda().eval()
 
     val_img_dir = Path("datasets/device_ports/images/val")
@@ -108,26 +108,16 @@ def main():
             components = radius_point_nms(components, 16.0, 300)
         if ports.shape[0]:
             ports = radius_point_nms(ports, 8.0, 300)
+        ports, link_tensor = associate_ports_to_components(components, ports)
 
         sx, sy = w / 640.0, h / 640.0
         components[:, 0] *= sx; components[:, 1] *= sy
         ports[:, 0] *= sx; ports[:, 1] *= sy
         ports[:, 3] *= sx; ports[:, 4] *= sy
 
-        links = []
-        if ports.shape[0] and components.shape[0]:
-            ppc = ports[:, 3:5].float()
-            cxy = components[:, :2].float()
-            dmat = torch.cdist(ppc.cpu(), cxy.cpu())
-            for pi in range(ports.shape[0]):
-                md, ci = dmat[pi].min(dim=0)
-                p2c = float(torch.norm(ports[pi, 3:5].cpu() - ports[pi, :2].cpu()))
-                if md <= min(32.0, max(8.0, 0.15 * p2c)):
-                    links.append([pi, int(ci)])
-
         pred_comps = components.cpu().numpy()
         pred_ports = ports.cpu().numpy()
-        pred_links = np.array(links) if links else np.zeros((0, 2))
+        pred_links = link_tensor[:, :2].cpu().numpy() if link_tensor.numel() else np.zeros((0, 2))
 
         n_gt_c, n_gt_p, n_gt_l = len(gt_components), len(gt_ports), len(gt_links)
         n_pd_c, n_pd_p, n_pd_l = len(pred_comps), len(pred_ports), len(pred_links)
